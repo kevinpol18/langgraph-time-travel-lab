@@ -23,12 +23,12 @@ State is one `TypedDict`:
 
 ```python
 class State(TypedDict):
-    messages: Annotated[list, add_messages]   # reducer, matters a lot (see §3)
+    messages: Annotated[list, add_messages]   # reducer, matters a lot (see §4)
     visited: Annotated[list[str], operator.add]
 ```
 
-Every node except `human_review` just appends one message and returns. `human_review` is
-the only interesting one:
+Every node except `human_review` just builds one message, emits it as a custom stream event
+(see §2), and returns it as its state update. `human_review` is the only interesting one:
 
 ```python
 def human_review(state: State) -> dict:
@@ -37,7 +37,9 @@ def human_review(state: State) -> dict:
         "question": "Please review the collected data and respond (e.g. 'approve' or 'reject: reason').",
         "context": last,
     })
-    return {"messages": [HumanMessage(content=str(answer))], "visited": ["human_review"]}
+    message = HumanMessage(content=str(answer))
+    _emit("human_review", message)
+    return {"messages": [message], "visited": ["human_review"]}
 ```
 
 `interrupt(payload)` raises internally, which the LangGraph runtime catches: it saves a
@@ -45,12 +47,84 @@ checkpoint, records the interrupt payload on that checkpoint's task list, and re
 to the client without running `process_decision`/`finalize`. When later resumed with
 `Command(resume=value)`, the runtime **re-executes `human_review` from the top** — everything
 before the `interrupt()` call runs again — but this time `interrupt()` returns `value`
-instead of raising, and the function continues normally.
+instead of raising, and the function continues normally (including the `_emit` call, which
+never happens on the raising path).
 
 No checkpointer is configured in `graph.py`. `langgraph dev` injects its own (SQLite-backed,
 in `.langgraph_api/`) automatically.
 
-## 2. What a checkpoint actually is
+## 2. How streaming works: custom events, not values
+
+Early versions of this app streamed with `stream_mode="values"`, which resends the **entire**
+accumulated state after every single step. That's wasteful (an N-message conversation resends
+all N messages on step N), and it doesn't generalize to token-level LLM streaming later. The
+app now streams `stream_mode=["custom", "updates"]` instead:
+
+- **`custom`** carries exactly what each node explicitly writes via `get_stream_writer()` —
+  nothing more. Every node in `graph.py` uses a small helper:
+  ```python
+  from langgraph.config import get_stream_writer
+
+  def _emit(node: str, message) -> None:
+      get_stream_writer()({"node": node, "message": message})
+  ```
+  Each custom event on the wire looks like:
+  ```json
+  {"node": "collect_data", "message": {"type": "ai", "content": "Collected data: ...", "id": null, ...}}
+  ```
+- **`updates`** is layered in purely to catch interrupts. It happens to also carry each node's
+  full delta (redundant with `custom` here), but the useful part is that it surfaces a clean,
+  dedicated event the platform generates natively — no manual bookkeeping required:
+  ```json
+  {"__interrupt__": [{"value": {"question": "...", "context": "..."}, "id": "..."}]}
+  ```
+  This event only appears exactly when a genuine new pause happens (never spuriously re-fires
+  on a successful resume), so detecting an interrupt is just: does this `updates` chunk have
+  an `__interrupt__` key?
+
+**The catch: `message.id` is `null` in the custom event.** `add_messages` (§4) is what assigns
+a message its real, stable id — and that happens when the reducer merges the node's *return
+value* into the checkpoint, which is a step **after** the custom event already fired. So
+anything streamed live over the custom channel is provisional. This app handles it by
+reconciling against the authoritative persisted checkpoint once the run ends:
+
+```ts
+// frontend/src/lib/useGraphThread.ts — runAndStream (abbreviated)
+let messages = seed.messages;      // see below -- where a run starts accumulating from
+let visited = seed.visited;
+for await (const chunk of stream) {
+  if (chunk.event === "custom") {
+    const { node, message } = chunk.data;
+    messages = [...messages, message];             // live preview, id may be null
+    visited = [...visited, node];
+    setLiveState({ messages, visited });
+  } else if (chunk.event === "updates" && chunk.data.__interrupt__?.length) {
+    setPendingInterrupt(chunk.data.__interrupt__[0].value);
+  }
+}
+// ...run ends...
+const states = await refreshHistory(tid);          // getHistory -- authoritative
+setLiveState(states[0].values);                     // real ids, guaranteed-correct content
+```
+
+**The other catch: custom events are deltas, not snapshots — the caller must supply the right
+starting point.** `values` mode was self-contained (each chunk was the complete state, so it
+didn't matter what happened before). Custom events are the *opposite*: each one is just "here
+is the one message this node just produced." Concatenating them blindly is wrong the moment a
+run doesn't start from empty state — which is most of the interesting cases in this app: continuing an existing conversation, replaying an old checkpoint, or re-entering an interrupt.
+So every call site passes an explicit `seed: GraphState` for `runAndStream` to start
+accumulating from:
+
+| Call | Seed |
+|---|---|
+| `startThread` | just the new human message (server assigns its real id; not yet known client-side) |
+| `continueConversation` | current `liveState.messages` + the new human message appended |
+| `submitInterruptResponse` | current `liveState.messages` unchanged (the answer arrives via `human_review`'s own custom event) |
+| `replayCheckpoint` / edit-and-fork's replay step | the target checkpoint's `values`, looked up from already-fetched `history` |
+| `resumeAtInterruptCheckpoint` step A | the interrupt checkpoint's `values` from `history` |
+| `resumeAtInterruptCheckpoint` step B | step A's own returned (reconciled) state — not stale React state, since `runAndStream` returns its final `GraphState` explicitly for exactly this chaining |
+
+## 3. What a checkpoint actually is
 
 Every checkpoint (`ThreadState` in the SDK) has:
 
@@ -85,7 +159,7 @@ history, and why the UI shows both action groups on that one checkpoint card.
 Fetch this whole picture with `client.threads.getHistory(threadId, { limit: 50 })` — it
 returns every checkpoint **across every branch**, newest-first.
 
-## 3. Why `add_messages` makes editing possible at all
+## 4. Why `add_messages` makes editing possible at all
 
 `messages: Annotated[list, add_messages]` isn't just "append to a list". `add_messages`
 upserts by message `id`: if you write a message whose `id` matches one already in the list,
@@ -103,7 +177,7 @@ client.threads.updateState(threadId, {
 as a child of the one you pointed at. The old checkpoint and everything that was built on it
 remains in history, untouched. This is the fork.
 
-## 4. Time travel on regular (non-interrupt) messages
+## 5. Time travel on regular (non-interrupt) messages
 
 Two operations, both starting from a checkpoint where a given message is the *last* entry in
 `values.messages` (i.e., the checkpoint captured right after that message was written):
@@ -136,13 +210,13 @@ Either way, the **newest checkpoint on the thread automatically becomes the thre
 immediately. There's no separate "make this the source of truth" step; it falls out of
 "newest checkpoint wins."
 
-## 5. Time travel on interrupts — the hard part
+## 6. Time travel on interrupts — the hard part
 
 This is where the obvious approach breaks, twice, in two different ways.
 
-### 5.1 The approach that looks right but silently does nothing
+### 6.1 The approach that looks right but silently does nothing
 
-By analogy with §4, you'd expect this to "go back and answer differently":
+By analogy with §5, you'd expect this to "go back and answer differently":
 
 ```ts
 // DOES NOT WORK once the thread has moved past this checkpoint
@@ -158,7 +232,7 @@ reason: `resume` is matched against the thread's *currently pending* task, not a
 historical one. If the interrupt was already resolved once, there is no pending task left for
 `resume` to match, `checkpoint` or not.
 
-### 5.2 The fix: two calls, not one
+### 6.2 The fix: two calls, not one
 
 ```ts
 // Step A -- re-enter the node fresh from the old checkpoint, no resume value supplied.
@@ -180,9 +254,9 @@ the node from its top), which calls `interrupt()` again with no resume value que
 so it pauses again, fresh. That fresh pause is a real live pending task, so step B's `resume`
 works exactly like answering a first-time interrupt.
 
-### 5.3 The deeper gotcha: don't re-enter a re-entry
+### 6.3 The deeper gotcha: don't re-enter a re-entry
 
-Editing the HITL answer once works fine with §5.2. Editing *that* edited answer again breaks
+Editing the HITL answer once works fine with §6.2. Editing *that* edited answer again breaks
 if you naively target "the checkpoint immediately before the message" — because that
 checkpoint is no longer the original; it's the fresh-pause checkpoint that step A of the
 *first* edit created.
@@ -217,14 +291,14 @@ function findRootInterruptIndex(chain: GraphThreadState[], idx: number): number 
 }
 ```
 
-`chain` here is the current branch's checkpoints in oldest→newest order (see §6). Both X and
+`chain` here is the current branch's checkpoints in oldest→newest order (see §7). Both X and
 X_a have `tasks[].interrupts` recorded (both were, at some point, paused at `human_review`) —
 the distinguishing signal is whether a checkpoint's *parent* is **also** an interrupt
 checkpoint. If it is, the checkpoint in question is itself a re-entry product, and you keep
-walking back. `computeMessageActions` (§6) calls this for every HITL-answer message, so the
+walking back. `computeMessageActions` (§7) calls this for every HITL-answer message, so the
 UI always targets X, never X_a/X_b/…, regardless of edit depth.
 
-## 6. Mapping a chat message to the right checkpoint (branch-aware)
+## 7. Mapping a chat message to the right checkpoint (branch-aware)
 
 `getHistory` returns every checkpoint from every branch ever created on the thread, mixed
 together, newest-first. To know "what is the chat window currently showing," you cannot just
@@ -246,7 +320,7 @@ function buildCurrentChain(history: GraphThreadState[]): GraphThreadState[] {
 
 Then, for each adjacent pair in that chain, if `values.messages` grew by one entry, that
 newest entry was "born" at the later checkpoint. If the checkpoint *before* it has a recorded
-interrupt, the message is a HITL answer, and its "act on this" checkpoint is the §5.3 root,
+interrupt, the message is a HITL answer, and its "act on this" checkpoint is the §6.3 root,
 not its immediate predecessor:
 
 ```ts
@@ -274,10 +348,12 @@ function computeMessageActions(chain: GraphThreadState[]): Map<string, MessageAc
 ```
 
 The chat UI's replay (↻) and edit (✎) icons on each human message call `replayMessage` /
-`editMessage`, which look up this map and dispatch to either §4's plain edit-fork or §5.2's
-two-step interrupt re-entry, automatically, per message.
+`editMessage`, which look up this map and dispatch to either §5's plain edit-fork or §6.2's
+two-step interrupt re-entry, automatically, per message. Note this map is always built from
+`history` (i.e. `getHistory`, with real assigned ids) — never from the transient custom-event
+stream (§2) — so it's unaffected by the `message.id === null` issue during live streaming.
 
-## 7. SDK-level gotchas (not LangGraph concepts — implementation traps)
+## 8. SDK-level gotchas (not LangGraph concepts — implementation traps)
 
 These cost the most debugging time and are specific to the installed
 `@langchain/langgraph-sdk` version:
@@ -305,8 +381,11 @@ These cost the most debugging time and are specific to the installed
   ```python
   graph.invoke(None, config, checkpoint_id=old_checkpoint_id)
   ```
+- **Custom-event message ids are `null` until persisted** (§2) — a platform behavior, not a
+  bug, but easy to trip over if you wire up React keys or lookups against the live stream
+  instead of against `getHistory`'s reconciled result.
 
-## 8. Detecting "is this conversation currently at an interrupt?"
+## 9. Detecting "is this conversation currently at an interrupt?"
 
 No manual checkpoint inspection needed for this part — the SDK's `Thread` object carries it
 directly:
@@ -335,10 +414,11 @@ if (thread.status === "interrupted") {
 This was verified to survive a full page reload — status/interrupts are read fresh from the
 server every time, not cached client state.
 
-## 9. Cheat sheet
+## 10. Cheat sheet
 
 | Want to... | Call |
 |---|---|
+| Stream a run, message-by-message | `runs.stream(tid, aid, { ..., streamMode: ["custom", "updates"] })` — read `chunk.data.message` on `"custom"`, `chunk.data.__interrupt__` on `"updates"` |
 | Replay a checkpoint unchanged | `runs.stream(tid, aid, { input: null, checkpoint: {checkpoint_id, checkpoint_ns:""} })` |
 | Edit a regular message & fork | `threads.updateState(tid, { values:{messages:[{id,type,content}]}, checkpointId })` → replay the returned checkpoint |
 | Answer a *live* interrupt | `runs.stream(tid, aid, { command: { resume: value } })` |

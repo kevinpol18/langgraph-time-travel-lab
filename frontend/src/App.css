@@ -1,5 +1,5 @@
 .app {
-  max-width: 900px;
+  max-width: 1200px;
   margin: 0 auto;
   padding: 24px 20px 64px;
 }
@@ -14,10 +14,39 @@ header h1 {
   color: var(--text);
 }
 
+.layout {
+  display: flex;
+  align-items: flex-start;
+  gap: 20px;
+}
+
+.sidebar {
+  width: 280px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 20px;
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+}
+
 main {
+  flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 20px;
+}
+
+@media (max-width: 860px) {
+  .layout {
+    flex-direction: column;
+  }
+
+  .sidebar {
+    width: 100%;
+    position: static;
+    max-height: none;
+  }
 }
 
 .panel {
@@ -67,14 +96,16 @@ main {
 }
 
 .conversations-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
   margin-bottom: 12px;
 }
 
 .conversations-header h2 {
   margin: 0;
+}
+
+.new-conversation-btn {
+  width: 100%;
+  margin-bottom: 14px;
 }
 
 .conversation-list {
@@ -89,9 +120,10 @@ main {
 .conversation-item {
   width: 100%;
   display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 12px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 8px 10px;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -103,18 +135,24 @@ main {
   background: var(--accent-bg);
 }
 
+.conversation-item-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
 .conversation-title {
   font-weight: 600;
   color: var(--text-h);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 220px;
+  font-size: 13px;
 }
 
 .conversation-snippet {
-  flex: 1;
-  font-size: 13px;
+  font-size: 12px;
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;

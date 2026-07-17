@@ -14,7 +14,7 @@ function snippet(thread: Thread<GraphState>): string {
   const last = messages[messages.length - 1];
   if (!last) return "(empty)";
   const content = typeof last.content === "string" ? last.content : JSON.stringify(last.content);
-  return content.length > 50 ? `${content.slice(0, 50)}…` : content;
+  return content.length > 60 ? `${content.slice(0, 60)}…` : content;
 }
 
 export function ConversationsPanel({
@@ -28,10 +28,10 @@ export function ConversationsPanel({
     <section className="panel">
       <div className="conversations-header">
         <h2>Conversations</h2>
-        <button type="button" disabled={isStreaming} onClick={onNew}>
-          + New conversation
-        </button>
       </div>
+      <button type="button" className="new-conversation-btn" disabled={isStreaming} onClick={onNew}>
+        + New conversation
+      </button>
       {conversations.length === 0 ? (
         <p className="checkpoint-note">No saved conversations yet -- start one above.</p>
       ) : (
@@ -44,10 +44,12 @@ export function ConversationsPanel({
                 disabled={isStreaming}
                 onClick={() => onSelect(t.thread_id)}
               >
-                <span className="conversation-title">
-                  {(t.metadata?.title as string | undefined) ?? t.thread_id}
+                <span className="conversation-item-top">
+                  <span className="conversation-title">
+                    {(t.metadata?.title as string | undefined) ?? t.thread_id}
+                  </span>
+                  <span className={`badge status-${t.status}`}>{t.status}</span>
                 </span>
-                <span className={`badge status-${t.status}`}>{t.status}</span>
                 <span className="conversation-snippet">{snippet(t)}</span>
               </button>
             </li>

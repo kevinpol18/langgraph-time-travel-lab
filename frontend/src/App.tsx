@@ -43,50 +43,54 @@ function App() {
 
       {error && <p className="error">{error}</p>}
 
-      <main>
-        <ConversationsPanel
-          conversations={conversations}
-          activeThreadId={threadId}
-          isStreaming={isStreaming}
-          onNew={startNewConversation}
-          onSelect={loadConversation}
-        />
-
-        <RunPanel
-          threadId={threadId}
-          threadTitle={threadTitle}
-          messages={liveState.messages}
-          isStreaming={isStreaming}
-          hasPendingInterrupt={!!pendingInterrupt}
-          messageActions={messageActions}
-          onStart={startThread}
-          onContinue={continueConversation}
-          onSaveTitle={saveConversationTitle}
-          onReplayMessage={replayMessage}
-          onEditMessage={editMessage}
-        />
-
-        {pendingInterrupt && (
-          <InterruptCard
-            interrupt={pendingInterrupt}
+      <div className="layout">
+        <aside className="sidebar">
+          <ConversationsPanel
+            conversations={conversations}
+            activeThreadId={threadId}
             isStreaming={isStreaming}
-            onSubmit={submitInterruptResponse}
+            onNew={startNewConversation}
+            onSelect={loadConversation}
           />
-        )}
+        </aside>
 
-        <details className="history-details">
-          <summary>Branch history (all checkpoints, all branches)</summary>
-          <HistoryPanel
-            history={history}
+        <main>
+          <RunPanel
+            threadId={threadId}
+            threadTitle={threadTitle}
+            messages={liveState.messages}
             isStreaming={isStreaming}
-            selectedCheckpointId={selectedCheckpointId}
-            onSelect={setSelectedCheckpointId}
-            onReplay={replayCheckpoint}
-            onEditAndFork={editAndForkMessage}
-            onResumeInterrupt={resumeAtInterruptCheckpoint}
+            hasPendingInterrupt={!!pendingInterrupt}
+            messageActions={messageActions}
+            onStart={startThread}
+            onContinue={continueConversation}
+            onSaveTitle={saveConversationTitle}
+            onReplayMessage={replayMessage}
+            onEditMessage={editMessage}
           />
-        </details>
-      </main>
+
+          {pendingInterrupt && (
+            <InterruptCard
+              interrupt={pendingInterrupt}
+              isStreaming={isStreaming}
+              onSubmit={submitInterruptResponse}
+            />
+          )}
+
+          <details className="history-details">
+            <summary>Branch history (all checkpoints, all branches)</summary>
+            <HistoryPanel
+              history={history}
+              isStreaming={isStreaming}
+              selectedCheckpointId={selectedCheckpointId}
+              onSelect={setSelectedCheckpointId}
+              onReplay={replayCheckpoint}
+              onEditAndFork={editAndForkMessage}
+              onResumeInterrupt={resumeAtInterruptCheckpoint}
+            />
+          </details>
+        </main>
+      </div>
     </div>
   );
 }

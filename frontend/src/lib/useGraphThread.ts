@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { Checkpoint, Command, Interrupt, Thread } from "@langchain/langgraph-sdk";
+import type { Checkpoint, Command, Interrupt, Message, Thread } from "@langchain/langgraph-sdk";
 import { ASSISTANT_ID, client } from "./client";
 import type { GraphState, GraphThreadState, PendingInterrupt } from "./types";
 
@@ -105,6 +105,11 @@ function toCheckpointRef(checkpointId?: string): Omit<Checkpoint, "thread_id"> |
 
 const emptyState: GraphState = { messages: [], visited: [] };
 
+function stateAtCheckpoint(history: GraphThreadState[], checkpointId: string): GraphState {
+  const found = history.find((s) => s.checkpoint.checkpoint_id === checkpointId);
+  return found ? { messages: found.values.messages ?? [], visited: found.values.visited ?? [] } : emptyState;
+}
+
 export function useGraphThread() {
   const [threadId, setThreadId] = useState<string | null>(null);
   const [threadTitle, setThreadTitle] = useState<string>("");
@@ -119,6 +124,7 @@ export function useGraphThread() {
   const refreshHistory = useCallback(async (tid: string) => {
     const states = await client.threads.getHistory<GraphState>(tid, { limit: 50 });
     setHistory(states);
+    return states;
   }, []);
 
   const refreshConversations = useCallback(async () => {
@@ -130,22 +136,42 @@ export function useGraphThread() {
     refreshConversations().catch((err) => setError(err instanceof Error ? err.message : String(err)));
   }, [refreshConversations]);
 
+  // Streams a run using "custom" events -- each node emits exactly the one message it just
+  // produced via get_stream_writer(), instead of resending the whole accumulated state
+  // every step ("values" mode). "updates" is layered in purely for a clean, dedicated
+  // __interrupt__ signal (native to the platform, no manual bookkeeping needed for that
+  // part). Because custom events carry only a delta, the caller must supply `seed`: the
+  // correct messages/visited to start accumulating from (e.g. the state at whichever
+  // checkpoint this run is forking from -- NOT necessarily the current head). The final
+  // state is always reconciled against the authoritative persisted checkpoint (via
+  // getHistory) once the run ends: messages streamed over the custom channel don't have
+  // their real id assigned yet -- that only happens when the reducer merges the node's
+  // return value into the checkpoint, which happens after the custom event fires.
   const runAndStream = useCallback(
-    async (tid: string, options: RunOptions) => {
+    async (tid: string, options: RunOptions, seed: GraphState): Promise<GraphState> => {
       setIsStreaming(true);
       setError(null);
       setPendingInterrupt(null);
+      let messages = seed.messages;
+      let visited = seed.visited;
+      setLiveState({ messages, visited });
       try {
         const { checkpointId, ...rest } = options;
         const stream = client.runs.stream(tid, ASSISTANT_ID, {
           ...rest,
           checkpoint: toCheckpointRef(checkpointId),
-          streamMode: "values",
+          streamMode: ["custom", "updates"],
         });
         for await (const chunk of stream) {
-          if (chunk.event === "values") {
-            const data = chunk.data as GraphState & { __interrupt__?: Array<{ id?: string; value?: Record<string, unknown> }> };
-            setLiveState({ messages: data.messages ?? [], visited: data.visited ?? [] });
+          if (chunk.event === "custom") {
+            const data = chunk.data as { node: string; message: Message };
+            messages = [...messages, data.message];
+            visited = [...visited, data.node];
+            setLiveState({ messages, visited });
+          } else if (chunk.event === "updates") {
+            const data = chunk.data as Record<string, unknown> & {
+              __interrupt__?: Array<{ id?: string; value?: Record<string, unknown> }>;
+            };
             if (data.__interrupt__?.length) {
               const intr = data.__interrupt__[0];
               setPendingInterrupt({
@@ -163,9 +189,16 @@ export function useGraphThread() {
         setError(err instanceof Error ? err.message : String(err));
       } finally {
         setIsStreaming(false);
-        await refreshHistory(tid);
+        const states = await refreshHistory(tid);
         await refreshConversations();
+        if (states.length > 0) {
+          const head = states[0].values;
+          messages = head.messages ?? [];
+          visited = head.visited ?? [];
+          setLiveState({ messages, visited });
+        }
       }
+      return { messages, visited };
     },
     [refreshHistory, refreshConversations],
   );
@@ -178,12 +211,13 @@ export function useGraphThread() {
         const thread = await client.threads.create({ metadata: { title: titleFromInput(inputText) } });
         setThreadId(thread.thread_id);
         setThreadTitle(titleFromInput(inputText));
-        setLiveState(emptyState);
         setHistory([]);
         setSelectedCheckpointId(null);
-        await runAndStream(thread.thread_id, {
-          input: { messages: [{ type: "human", content: inputText }] },
-        });
+        await runAndStream(
+          thread.thread_id,
+          { input: { messages: [{ type: "human", content: inputText }] } },
+          { messages: [{ type: "human", content: inputText }], visited: [] },
+        );
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
         setIsStreaming(false);
@@ -195,9 +229,13 @@ export function useGraphThread() {
   const continueConversation = useCallback(
     async (inputText: string) => {
       if (!threadId) return;
-      await runAndStream(threadId, { input: { messages: [{ type: "human", content: inputText }] } });
+      const seed: GraphState = {
+        messages: [...liveState.messages, { type: "human", content: inputText }],
+        visited: liveState.visited,
+      };
+      await runAndStream(threadId, { input: { messages: [{ type: "human", content: inputText }] } }, seed);
     },
-    [threadId, runAndStream],
+    [threadId, liveState, runAndStream],
   );
 
   const loadConversation = useCallback(
@@ -250,17 +288,18 @@ export function useGraphThread() {
   const submitInterruptResponse = useCallback(
     async (answer: string) => {
       if (!threadId) return;
-      await runAndStream(threadId, { command: { resume: answer } });
+      await runAndStream(threadId, { command: { resume: answer } }, liveState);
     },
-    [threadId, runAndStream],
+    [threadId, liveState, runAndStream],
   );
 
   const replayCheckpoint = useCallback(
     async (checkpointId: string) => {
       if (!threadId) return;
-      await runAndStream(threadId, { input: null, checkpointId });
+      const seed = stateAtCheckpoint(history, checkpointId);
+      await runAndStream(threadId, { input: null, checkpointId }, seed);
     },
-    [threadId, runAndStream],
+    [threadId, history, runAndStream],
   );
 
   const editAndForkMessage = useCallback(
@@ -273,12 +312,17 @@ export function useGraphThread() {
           checkpointId,
         });
         const newCheckpointId = newConfig.configurable?.checkpoint_id as string;
-        await runAndStream(threadId, { input: null, checkpointId: newCheckpointId });
+        const base = stateAtCheckpoint(history, checkpointId);
+        const seed: GraphState = {
+          messages: base.messages.map((m) => (m.id === message.id ? { ...m, content: newContent } : m)),
+          visited: base.visited,
+        };
+        await runAndStream(threadId, { input: null, checkpointId: newCheckpointId }, seed);
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
       }
     },
-    [threadId, runAndStream],
+    [threadId, history, runAndStream],
   );
 
   const resumeAtInterruptCheckpoint = useCallback(
@@ -289,10 +333,11 @@ export function useGraphThread() {
       // a *currently* pending interrupt). So this is two steps: first re-enter human_review
       // from the old checkpoint with no input, which re-executes interrupt() and pauses
       // fresh (this becomes the new branch's head); then resume that fresh pause normally.
-      await runAndStream(threadId, { input: null, checkpointId });
-      await runAndStream(threadId, { command: { resume: answer } });
+      const seed = stateAtCheckpoint(history, checkpointId);
+      const afterReentry = await runAndStream(threadId, { input: null, checkpointId }, seed);
+      await runAndStream(threadId, { command: { resume: answer } }, afterReentry);
     },
-    [threadId, runAndStream],
+    [threadId, history, runAndStream],
   );
 
   const chain = useMemo(() => buildCurrentChain(history), [history]);
