@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.log
+.langgraph_api/
+
+# Secrets / local certs -- never commit these
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+.env
+.env.*
+!.env.example
